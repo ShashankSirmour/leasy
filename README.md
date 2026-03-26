@@ -23,169 +23,163 @@ src/
     └── dynamodb.rs # DynamoDB backend (conditional writes)
 ```
 
-## Quick Start
+## Dependencies
+
+Add these to your consuming project's `Cargo.toml`:
 
 ```toml
-# Cargo.toml of your consuming project
 [dependencies]
 leasy = { path = "../lib/Leasy", features = ["dynamodb"] }
 tokio = { version = "1", features = ["full"] }
 aws-sdk-dynamodb = "1"
+aws-sdk-kinesis = "1"
 aws-config = "1"
 uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+tracing = "0.1"
 tracing-subscriber = "0.3"
 ```
 
-### DynamoDB Table Setup
+---
+
+## DynamoDB Table Setup
 
 Create a table with partition key `lease_key` (String). No sort key needed.
 
 ```bash
 aws dynamodb create-table \
-  --table-name my-leases \
+  --table-name kinesis-shard-leases \
   --attribute-definitions AttributeName=lease_key,AttributeType=S \
   --key-schema AttributeName=lease_key,KeyType=HASH \
   --billing-mode PAY_PER_REQUEST
 ```
 
-### Basic Usage
-
-```rust
-use std::sync::Arc;
-use tokio::time::{sleep, Duration};
-use leasy::{LeaseConfig, LeaseManager, DynamoLeaseStore};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let aws_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-    let dynamo = aws_sdk_dynamodb::Client::new(&aws_config);
-
-    let store = Arc::new(DynamoLeaseStore::new(dynamo, "my-leases", 10_000));
-    let worker_id = uuid::Uuid::new_v4().to_string();
-    let manager = Arc::new(LeaseManager::new(store, worker_id, LeaseConfig::default()));
-
-    // Register resources
-    for key in &["job-a", "job-b", "job-c"] {
-        manager.ensure_lease(key).await?;
-    }
-
-    manager.clone().start_background_tasks();
-
-    loop {
-        for key in manager.get_my_lease_keys().await? {
-            println!("Processing {}", key);
-        }
-        sleep(Duration::from_secs(1)).await;
-    }
-}
-```
-
 ---
 
-### Kinesis Shard Consumer (replacing KCL)
+## Example: Kinesis Shard Consumer (replacing KCL)
 
-This is the primary use case — each ECS Fargate task runs this, and Leasy
-automatically distributes shards across all running tasks.
+Each ECS Fargate task runs this. Leasy automatically distributes shards
+across all running tasks, handles failover, and checkpoints progress.
 
 ```rust
+use anyhow::Result;
+use aws_config::BehaviorVersion;
+use aws_sdk_kinesis::types::ShardIteratorType;
+use leasy::{DynamoLeaseStore, LeaseConfig, LeaseManager};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
-use aws_config::BehaviorVersion;
-use leasy::{LeaseConfig, LeaseManager, DynamoLeaseStore};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
+    // ── AWS clients ──────────────────────────────────────────────────
     let aws_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-    let dynamo = aws_sdk_dynamodb::Client::new(&aws_config);
-    let kinesis = aws_sdk_kinesis::Client::new(&aws_config);
+    let dynamo_client = aws_sdk_dynamodb::Client::new(&aws_config);
+    let kinesis_client = aws_sdk_kinesis::Client::new(&aws_config);
 
-    // 1. Create lease store + manager
-    let lease_duration_ms = 10_000; // 10s — gives 7s buffer with 3s renewal
+    // ── Lease store + manager ────────────────────────────────────────
+    let lease_duration_ms = 10_000; // 10s lease; with 3s renewal → 7s safety buffer
     let store = Arc::new(DynamoLeaseStore::new(
-        dynamo,
-        "kinesis-shard-leases",
+        dynamo_client,
+        "kinesis-shard-leases", // DynamoDB table name (PK = lease_key)
         lease_duration_ms,
     ));
 
-    // On ECS Fargate, use the task ARN for stable worker identity.
-    // Falls back to UUID if not on ECS.
+    // On ECS Fargate use the task ARN for a stable worker identity.
+    // Falls back to a random UUID if not on ECS.
     let worker_id = std::env::var("ECS_TASK_ARN")
         .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
 
     let config = LeaseConfig {
-        lease_duration_ms: 10_000,
-        renewal_interval_ms: 3_000,
-        rebalance_interval_ms: 5_000,
-        max_leases_per_worker: None,
+        lease_duration_ms: 10_000,   // must match store
+        renewal_interval_ms: 3_000,  // renew every 3s
+        rebalance_interval_ms: 5_000,// rebalance every 5s (+jitter)
+        max_leases_per_worker: None, // no cap
     };
 
     let manager = Arc::new(LeaseManager::new(store, worker_id, config));
 
-    // 2. Discover shards and register them as leases
+    // ── Discover shards and register as leases ───────────────────────
     let stream_name = "my-kinesis-stream";
-    let shards = kinesis
-        .list_shards()
-        .stream_name(stream_name)
-        .send()
-        .await?
-        .shards
-        .unwrap_or_default();
+    let mut shard_ids: Vec<String> = Vec::new();
+    let mut next_token: Option<String> = None;
 
-    for shard in &shards {
-        manager.ensure_lease(&shard.shard_id).await?;
+    loop {
+        let mut req = kinesis_client.list_shards().stream_name(stream_name);
+        if let Some(token) = next_token.take() {
+            req = req.next_token(token);
+        }
+        let resp = req.send().await?;
+
+        if let Some(shards) = resp.shards {
+            for shard in &shards {
+                shard_ids.push(shard.shard_id().to_string());
+            }
+        }
+
+        next_token = resp.next_token().map(|s| s.to_string());
+        if next_token.is_none() {
+            break;
+        }
     }
 
-    // 3. Start background renewal + rebalance loops
+    shard_ids.sort(); // deterministic order across all workers
+    tracing::info!("Discovered {} shards", shard_ids.len());
+
+    for shard_id in &shard_ids {
+        manager.ensure_lease(shard_id).await?;
+    }
+
+    // ── Start background renewal + rebalance loops ───────────────────
     manager.clone().start_background_tasks();
 
-    // 4. Processing loop — only processes shards assigned to this worker
+    // ── Processing loop ──────────────────────────────────────────────
     loop {
         let my_shards = manager.get_my_lease_keys().await?;
-        tracing::info!("Processing {} shards", my_shards.len());
+        tracing::info!("This worker owns {} shards", my_shards.len());
 
         for shard_id in &my_shards {
-            // Get last checkpoint (sequence number) for this shard
+            // Resume from last checkpoint (sequence number) or start from TRIM_HORIZON
             let checkpoint = manager.get_checkpoint(shard_id).await?;
 
-            let mut iter_req = kinesis.get_shard_iterator()
+            let mut iter_req = kinesis_client
+                .get_shard_iterator()
                 .stream_name(stream_name)
                 .shard_id(shard_id);
 
             iter_req = match &checkpoint {
                 Some(seq) => iter_req
-                    .shard_iterator_type(aws_sdk_kinesis::types::ShardIteratorType::AfterSequenceNumber)
+                    .shard_iterator_type(ShardIteratorType::AfterSequenceNumber)
                     .starting_sequence_number(seq),
-                None => iter_req
-                    .shard_iterator_type(aws_sdk_kinesis::types::ShardIteratorType::TrimHorizon),
+                None => iter_req.shard_iterator_type(ShardIteratorType::TrimHorizon),
             };
 
             let iterator = iter_req.send().await?.shard_iterator;
 
             if let Some(iter) = iterator {
-                let records_output = kinesis
+                let output = kinesis_client
                     .get_records()
                     .shard_iterator(&iter)
                     .limit(1000)
                     .send()
                     .await?;
 
-                let records = records_output.records;
-
-                for record in &records {
-                    // --- Your business logic here ---
+                for record in &output.records {
                     let data = record.data().as_ref();
                     tracing::debug!(
-                        "Shard {} seq {}: {} bytes",
+                        "shard={} seq={} bytes={}",
                         shard_id,
                         record.sequence_number(),
                         data.len()
                     );
+
+                    // ─── YOUR BUSINESS LOGIC HERE ───
+                    // process_record(data).await?;
                 }
 
-                // Checkpoint the last sequence number
-                if let Some(last) = records.last() {
+                // Checkpoint the last sequence number we processed
+                if let Some(last) = output.records.last() {
                     manager
                         .checkpoint(shard_id, last.sequence_number())
                         .await?;
@@ -197,6 +191,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 ```
+
+---
 
 ## Architecture
 
@@ -210,11 +206,11 @@ Create → Acquire → Renew → Release
 ### Split Brain Prevention
 DynamoDB conditional writes on a monotonic `counter` field. If two workers
 race to acquire/renew the same lease, exactly one succeeds — the other gets
-`false` and backs off.
+`false` and backs off gracefully.
 
 ### Rebalance Algorithm
 ```
-total_leases  = 10
+total_leases   = 10
 active_workers = 3
 target_per_worker = ceil(10/3) = 4
 
@@ -222,10 +218,12 @@ Worker A → 4 leases
 Worker B → 3 leases
 Worker C → 3 leases
 ```
-Priority: unowned leases first, then expired leases. Jitter on the rebalance
-interval prevents thundering herd on DynamoDB.
+Priority order: unowned leases first, then expired leases.
+Jitter on the rebalance interval prevents thundering herd on DynamoDB.
 
 ### Failure Recovery
-Worker crashes → stops renewing → lease `expires_at` passes →
-next rebalance cycle on surviving workers detects expiry →
-they steal the lease → processing resumes automatically.
+```
+Worker crashes → stops renewing → lease expires_at passes →
+next rebalance on surviving workers detects expiry →
+steals the lease → processing resumes from last checkpoint
+```

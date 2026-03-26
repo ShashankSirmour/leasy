@@ -192,9 +192,13 @@ impl<S: LeaseStorage + 'static> LeaseManager<S> {
         // Rebalance loop with jitter to prevent thundering herd
         let manager_rebalance = self.clone();
         tokio::spawn(async move {
-            let mut rng = rand::thread_rng();
             loop {
-                let jitter = rng.gen_range(0..1000u64);
+                // Generate jitter inline — thread_rng() is !Send so we
+                // must not hold it across the .await boundary
+                let jitter = {
+                    let mut rng = rand::thread_rng();
+                    rng.gen_range(0..1000u64)
+                };
                 sleep(Duration::from_millis(
                     (manager_rebalance.config.rebalance_interval_ms as u64) + jitter,
                 ))
