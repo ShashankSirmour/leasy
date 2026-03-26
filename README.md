@@ -56,6 +56,41 @@ aws dynamodb create-table \
 
 ---
 
+## Basic Usage
+
+```rust
+use std::sync::Arc;
+use tokio::time::{sleep, Duration};
+use leasy::{LeaseConfig, LeaseManager, DynamoLeaseStore};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let aws_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    let dynamo = aws_sdk_dynamodb::Client::new(&aws_config);
+
+    // Auto-creates the table if it's missing (PAY_PER_REQUEST, PK=lease_key)
+    let store = Arc::new(DynamoLeaseStore::new(dynamo, "my-leases", 10_000).await?);
+    let worker_id = uuid::Uuid::new_v4().to_string();
+    let manager = Arc::new(LeaseManager::new(store, worker_id, LeaseConfig::default()));
+
+    // Register resources
+    for key in &["job-a", "job-b", "job-c"] {
+        manager.ensure_lease(key).await?;
+    }
+
+    manager.clone().start_background_tasks();
+
+    loop {
+        for key in manager.get_my_lease_keys().await? {
+            println!("Processing {}", key);
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+```
+
+---
+
 ## Example: Kinesis Shard Consumer (replacing KCL)
 
 Each ECS Fargate task runs this. Leasy automatically distributes shards
@@ -80,11 +115,13 @@ async fn main() -> Result<()> {
 
     // ── Lease store + manager ────────────────────────────────────────
     let lease_duration_ms = 10_000; // 10s lease; with 3s renewal → 7s safety buffer
+    
+    // Auto-creates the table if it's missing (PAY_PER_REQUEST, PK=lease_key)
     let store = Arc::new(DynamoLeaseStore::new(
         dynamo_client,
-        "kinesis-shard-leases", // DynamoDB table name (PK = lease_key)
+        "kinesis-shard-leases", 
         lease_duration_ms,
-    ));
+    ).await?);
 
     // On ECS Fargate use the task ARN for a stable worker identity.
     // Falls back to a random UUID if not on ECS.

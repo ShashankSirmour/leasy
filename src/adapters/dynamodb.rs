@@ -51,7 +51,7 @@ impl DynamoLeaseStore {
                 .await
                 .map_err(|e| LeaseError::Storage(format!("Failed to create table: {}", e)))?;
 
-            // Wait until table is active
+            // Wait until table is active timeout after 30 seconds
             client
                 .waiter()
                 .wait_until_table_exists()
