@@ -79,11 +79,26 @@ impl<S: LeaseStorage + 'static> LeaseManager<S> {
 
     pub async fn renew_my_leases(&self) -> Result<()> {
         let leases = self.storage.list_leases().await?;
-        for lease in self.my_leases(&leases) {
-            if let Err(e) = self.storage.renew_lease(lease).await {
-                warn!("Failed to renew lease {}: {}", lease.lease_key, e);
+        let my_leases = self.my_leases(&leases);
+
+        let mut handles = tokio::task::JoinSet::new();
+
+        for lease in my_leases {
+            let storage = self.storage.clone();
+            let l = lease.clone();
+            handles.spawn(async move {
+                if let Err(e) = storage.renew_lease(&l).await {
+                    warn!("Failed to renew lease {}: {}", l.lease_key, e);
+                }
+            });
+        }
+
+        while let Some(res) = handles.join_next().await {
+            if let Err(e) = res {
+                error!("Task join error during renewal: {}", e);
             }
         }
+
         Ok(())
     }
 
