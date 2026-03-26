@@ -2,6 +2,8 @@
 name = "leasy"
 version = "0.1.0"
 edition = "2021"
+description = "Distributed lease management library"
+license = "MIT"
 
 [features]
 default = []
