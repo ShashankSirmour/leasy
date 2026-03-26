@@ -12,12 +12,60 @@ pub struct DynamoLeaseStore {
 }
 
 impl DynamoLeaseStore {
-    pub fn new(client: Client, table_name: impl Into<String>, lease_duration_ms: i64) -> Self {
-        Self {
-            client,
-            table_name: table_name.into(),
-            lease_duration_ms,
+    pub async fn new(client: Client, table_name: impl Into<String>, lease_duration_ms: i64) -> Result<Self> {
+        let table_name = table_name.into();
+
+        // Auto-create table if it doesn't exist
+        let exists = client
+            .describe_table()
+            .table_name(&table_name)
+            .send()
+            .await
+            .is_ok();
+
+        if !exists {
+            use aws_sdk_dynamodb::types::{
+                AttributeDefinition, KeySchemaElement, KeyType,
+                ScalarAttributeType, BillingMode,
+            };
+
+            client
+                .create_table()
+                .table_name(&table_name)
+                .attribute_definitions(
+                    AttributeDefinition::builder()
+                        .attribute_name("lease_key")
+                        .attribute_type(ScalarAttributeType::S)
+                        .build()
+                        .map_err(|e| LeaseError::Storage(e.to_string()))?,
+                )
+                .key_schema(
+                    KeySchemaElement::builder()
+                        .attribute_name("lease_key")
+                        .key_type(KeyType::Hash)
+                        .build()
+                        .map_err(|e| LeaseError::Storage(e.to_string()))?,
+                )
+                .billing_mode(BillingMode::PayPerRequest)
+                .send()
+                .await
+                .map_err(|e| LeaseError::Storage(format!("Failed to create table: {}", e)))?;
+
+            // Wait until table is active
+            client
+                .waiter()
+                .wait_until_table_exists()
+                .table_name(&table_name)
+                .wait(std::time::Duration::from_secs(30))
+                .await
+                .map_err(|e| LeaseError::Storage(format!("Table creation timeout: {}", e)))?;
         }
+
+        Ok(Self {
+            client,
+            table_name,
+            lease_duration_ms,
+        })
     }
 
     fn parse_lease(item: &HashMap<String, AttributeValue>) -> Lease {
