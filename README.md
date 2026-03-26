@@ -1,82 +1,231 @@
 # Leasy
 
-A generic, highly-available distributed lease manager in Rust.
+A generic distributed lease manager in Rust — storage agnostic, split-brain safe.
 
-**Leasy** is designed to coordinate distributed work across multiple workers. It is not tied to any specific system (like Kinesis) and can be used for:
-- Shard partition assignments (Kinesis, Kafka, etc.)
-- SQS queue partition reading
-- Cron job deduplication (ensuring only 1 task runs a job)
-- Database partition processing
-- Leader election
+## Use Cases
+- **Kinesis shard assignment** — replace KCL with your own lease coordination
+- **Cron job deduplication** — only 1 worker runs a scheduled job
+- **Leader election** — elect a single master node
+- **Database partition processing** — coordinate bulk data jobs
 
-## Features
-- **Storage Agnostic:** Core logic operates over a `LeaseStorage` trait.
-- **DynamoDB Backend Included:** Ship with a production-ready DynamoDB backend to prevent split-brain scenarios using conditional writes.
-- **Automatic Background Rebalancing:** Workers automatically steal expired leases and balance the load without a central coordinator.
-- **Clock Skew Protection:** Built-in grace periods prevent premature lease stealing.
+## Project Structure
 
-## Usage
+```
+src/
+├── lib.rs          # Public exports
+├── config.rs       # LeaseConfig with tunable intervals
+├── error.rs        # LeaseError enum
+├── lease.rs        # Lease struct + helpers
+├── manager.rs      # LeaseManager — core rebalance & renewal engine
+├── storage.rs      # LeaseStorage trait (implement for any backend)
+└── adapters/
+    ├── mod.rs      # Feature-gated adapter modules
+    └── dynamodb.rs # DynamoDB backend (conditional writes)
+```
 
-Add `tokio`, `aws-config` and `aws-sdk-dynamodb` along with this project to your dependencies if utilizing DynamoDB. Or simply point to `leasy` locally.
+## Quick Start
 
-### Quickstart with DynamoDB
+```toml
+# Cargo.toml of your consuming project
+[dependencies]
+leasy = { path = "../lib/Leasy", features = ["dynamodb"] }
+tokio = { version = "1", features = ["full"] }
+aws-sdk-dynamodb = "1"
+aws-config = "1"
+uuid = { version = "1", features = ["v4"] }
+tracing-subscriber = "0.3"
+```
+
+### DynamoDB Table Setup
+
+Create a table with partition key `lease_key` (String). No sort key needed.
+
+```bash
+aws dynamodb create-table \
+  --table-name my-leases \
+  --attribute-definitions AttributeName=lease_key,AttributeType=S \
+  --key-schema AttributeName=lease_key,KeyType=HASH \
+  --billing-mode PAY_PER_REQUEST
+```
+
+### Basic Usage
+
+```rust
+use std::sync::Arc;
+use tokio::time::{sleep, Duration};
+use leasy::{LeaseConfig, LeaseManager, DynamoLeaseStore};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let aws_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    let dynamo = aws_sdk_dynamodb::Client::new(&aws_config);
+
+    let store = Arc::new(DynamoLeaseStore::new(dynamo, "my-leases", 10_000));
+    let worker_id = uuid::Uuid::new_v4().to_string();
+    let manager = Arc::new(LeaseManager::new(store, worker_id, LeaseConfig::default()));
+
+    // Register resources
+    for key in &["job-a", "job-b", "job-c"] {
+        manager.ensure_lease(key).await?;
+    }
+
+    manager.clone().start_background_tasks();
+
+    loop {
+        for key in manager.get_my_lease_keys().await? {
+            println!("Processing {}", key);
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+```
+
+---
+
+### Kinesis Shard Consumer (replacing KCL)
+
+This is the primary use case — each ECS Fargate task runs this, and Leasy
+automatically distributes shards across all running tasks.
 
 ```rust
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use aws_config::BehaviorVersion;
-use leasy::{LeaseConfig, LeaseManager};
-use leasy::adapters::dynamodb::DynamoLeaseStore;
+use leasy::{LeaseConfig, LeaseManager, DynamoLeaseStore};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Initialize DynamoDB Client
-    let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-    let client = aws_sdk_dynamodb::Client::new(&config);
+    tracing_subscriber::fmt::init();
 
-    // 2. Configure Lease Store & Manager
-    let lease_duration_ms = 10_000;
+    let aws_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+    let dynamo = aws_sdk_dynamodb::Client::new(&aws_config);
+    let kinesis = aws_sdk_kinesis::Client::new(&aws_config);
+
+    // 1. Create lease store + manager
+    let lease_duration_ms = 10_000; // 10s — gives 7s buffer with 3s renewal
     let store = Arc::new(DynamoLeaseStore::new(
-        client, 
-        "my-distributed-leases", // Make sure this table is created with PK `lease_key`
-        lease_duration_ms
+        dynamo,
+        "kinesis-shard-leases",
+        lease_duration_ms,
     ));
-    
-    let worker_id = uuid::Uuid::new_v4().to_string(); // Or use ECS Task ID
-    let config = LeaseConfig::default(); // 10s lease, 3s renew, 5s rebalance
-    
+
+    // On ECS Fargate, use the task ARN for stable worker identity.
+    // Falls back to UUID if not on ECS.
+    let worker_id = std::env::var("ECS_TASK_ARN")
+        .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+
+    let config = LeaseConfig {
+        lease_duration_ms: 10_000,
+        renewal_interval_ms: 3_000,
+        rebalance_interval_ms: 5_000,
+        max_leases_per_worker: None,
+    };
+
     let manager = Arc::new(LeaseManager::new(store, worker_id, config));
 
-    // 3. Register your resources (e.g., Kinesis Shards, cron jobs)
-    let resources = vec!["shard-0001", "shard-0002", "shard-0003"];
-    for resource in resources {
-        manager.ensure_lease(resource).await?;
+    // 2. Discover shards and register them as leases
+    let stream_name = "my-kinesis-stream";
+    let shards = kinesis
+        .list_shards()
+        .stream_name(stream_name)
+        .send()
+        .await?
+        .shards
+        .unwrap_or_default();
+
+    for shard in &shards {
+        manager.ensure_lease(&shard.shard_id).await?;
     }
 
-    // 4. Start background renewal & rebalance loops
+    // 3. Start background renewal + rebalance loops
     manager.clone().start_background_tasks();
 
-    // 5. Your Processing Loop
+    // 4. Processing loop — only processes shards assigned to this worker
     loop {
-        let my_leases = manager.get_my_lease_keys().await?;
-        
-        for lease_key in my_leases {
-            println!("I am processing {}!", lease_key);
-            
-            // Example workflow:
-            // let checkpoint = manager.get_checkpoint(&lease_key).await?;
-            // let new_data = fetch_data(checkpoint).await;
-            // process(new_data).await;
-            // manager.checkpoint(&lease_key, "new-checkpoint-seq").await?;
+        let my_shards = manager.get_my_lease_keys().await?;
+        tracing::info!("Processing {} shards", my_shards.len());
+
+        for shard_id in &my_shards {
+            // Get last checkpoint (sequence number) for this shard
+            let checkpoint = manager.get_checkpoint(shard_id).await?;
+
+            let mut iter_req = kinesis.get_shard_iterator()
+                .stream_name(stream_name)
+                .shard_id(shard_id);
+
+            iter_req = match &checkpoint {
+                Some(seq) => iter_req
+                    .shard_iterator_type(aws_sdk_kinesis::types::ShardIteratorType::AfterSequenceNumber)
+                    .starting_sequence_number(seq),
+                None => iter_req
+                    .shard_iterator_type(aws_sdk_kinesis::types::ShardIteratorType::TrimHorizon),
+            };
+
+            let iterator = iter_req.send().await?.shard_iterator;
+
+            if let Some(iter) = iterator {
+                let records_output = kinesis
+                    .get_records()
+                    .shard_iterator(&iter)
+                    .limit(1000)
+                    .send()
+                    .await?;
+
+                let records = records_output.records;
+
+                for record in &records {
+                    // --- Your business logic here ---
+                    let data = record.data().as_ref();
+                    tracing::debug!(
+                        "Shard {} seq {}: {} bytes",
+                        shard_id,
+                        record.sequence_number(),
+                        data.len()
+                    );
+                }
+
+                // Checkpoint the last sequence number
+                if let Some(last) = records.last() {
+                    manager
+                        .checkpoint(shard_id, last.sequence_number())
+                        .await?;
+                }
+            }
         }
-        
-        sleep(Duration::from_millis(1000)).await;
+
+        sleep(Duration::from_millis(200)).await;
     }
 }
 ```
 
 ## Architecture
 
-1. **Lease Lifecycle:** Create → Acquire → Renew → Release / Expire → Steal
-2. **Split Brain Prevention:** The DynamoDB backend utilizes conditional updates on a monotonically increasing counter. If two workers try to acquire the same lease, only one wins.
-3. **Thundering Herd Mitigation:** Jitter is added to rebalance intervals to prevent all instances hammering the database simultaneously.
+### Lease Lifecycle
+```
+Create → Acquire → Renew → Release
+                     ↓
+                  Expire → Steal (by another worker)
+```
+
+### Split Brain Prevention
+DynamoDB conditional writes on a monotonic `counter` field. If two workers
+race to acquire/renew the same lease, exactly one succeeds — the other gets
+`false` and backs off.
+
+### Rebalance Algorithm
+```
+total_leases  = 10
+active_workers = 3
+target_per_worker = ceil(10/3) = 4
+
+Worker A → 4 leases
+Worker B → 3 leases
+Worker C → 3 leases
+```
+Priority: unowned leases first, then expired leases. Jitter on the rebalance
+interval prevents thundering herd on DynamoDB.
+
+### Failure Recovery
+Worker crashes → stops renewing → lease `expires_at` passes →
+next rebalance cycle on surviving workers detects expiry →
+they steal the lease → processing resumes automatically.

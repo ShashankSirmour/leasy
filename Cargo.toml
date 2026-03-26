@@ -9,14 +9,10 @@ dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config"]
 
 [dependencies]
 async-trait = "0.1"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
 tracing = "0.1"
 thiserror = "2.0"
-uuid = { version = "1.0", features = ["v4"] }
 rand = "0.8"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-reqwest = { version = "0.12", features = ["json"] }
 
 aws-sdk-dynamodb = { version = "1.0", optional = true }
 aws-config = { version = "1.0", optional = true }
