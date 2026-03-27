@@ -68,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
     let aws_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let dynamo = aws_sdk_dynamodb::Client::new(&aws_config);
 
-    // Auto-creates the table if it's missing (PAY_PER_REQUEST, PK=lease_key)
+    // Assumes the table already exists (PK=lease_key)
     let store = Arc::new(DynamoLeaseStore::new(dynamo, "my-leases", 10_000).await?);
     let worker_id = uuid::Uuid::new_v4().to_string();
     let manager = Arc::new(LeaseManager::new(store, worker_id, LeaseConfig::default()));
@@ -116,7 +116,7 @@ async fn main() -> Result<()> {
     // ── Lease store + manager ────────────────────────────────────────
     let lease_duration_ms = 10_000; // 10s lease; with 3s renewal → 7s safety buffer
     
-    // Auto-creates the table if it's missing (PAY_PER_REQUEST, PK=lease_key)
+    // Assumes the table already exists (PK=lease_key)
     let store = Arc::new(DynamoLeaseStore::new(
         dynamo_client,
         "kinesis-shard-leases", 
