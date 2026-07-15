@@ -2,8 +2,50 @@ use crate::error::{LeaseError, Result};
 use crate::lease::{epoch_ms, Lease};
 use crate::storage::LeaseStorage;
 use async_trait::async_trait;
+use aws_sdk_dynamodb::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::{types::AttributeValue, Client};
 use std::collections::HashMap;
+
+type Item = HashMap<String, AttributeValue>;
+
+fn s(v: &str) -> AttributeValue {
+    AttributeValue::S(v.to_string())
+}
+
+fn n(v: i64) -> AttributeValue {
+    AttributeValue::N(v.to_string())
+}
+
+fn get_s(item: &Item, key: &str) -> Option<String> {
+    item.get(key).and_then(|v| v.as_s().ok()).cloned()
+}
+
+fn get_n(item: &Item, key: &str) -> i64 {
+    item.get(key)
+        .and_then(|v| v.as_n().ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+fn storage_err(e: impl std::error::Error) -> LeaseError {
+    LeaseError::Storage(DisplayErrorContext(e).to_string())
+}
+
+fn is_condition_failed<E: ProvideErrorMetadata>(err: &SdkError<E>) -> bool {
+    err.code() == Some("ConditionalCheckFailedException")
+}
+
+/// Maps a conditional write result: success → true, condition failed → false.
+fn cond_result<T, E>(res: std::result::Result<T, SdkError<E>>) -> Result<bool>
+where
+    E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
+{
+    match res {
+        Ok(_) => Ok(true),
+        Err(ref e) if is_condition_failed(e) => Ok(false),
+        Err(e) => Err(storage_err(e)),
+    }
+}
 
 pub struct DynamoLeaseStore {
     client: Client,
@@ -12,261 +54,156 @@ pub struct DynamoLeaseStore {
 }
 
 impl DynamoLeaseStore {
-    pub async fn new(client: Client, table_name: impl Into<String>, lease_duration_ms: i64) -> Result<Self> {
-        let table_name = table_name.into();
-
+    pub async fn new(
+        client: Client,
+        table_name: impl Into<String>,
+        lease_duration_ms: i64,
+    ) -> Result<Self> {
         Ok(Self {
             client,
-            table_name,
+            table_name: table_name.into(),
             lease_duration_ms,
         })
     }
 
-    fn parse_lease(item: &HashMap<String, AttributeValue>) -> Lease {
-        let lease_key = item
-            .get("lease_key")
-            .and_then(|v| v.as_s().ok())
-            .cloned()
-            .unwrap_or_default();
-
-        let owner = item
-            .get("owner")
-            .and_then(|v| v.as_s().ok())
-            .cloned();
-
-        let counter = item
-            .get("counter")
-            .and_then(|v| v.as_n().ok())
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(0);
-
-        let expires_at = item
-            .get("expires_at")
-            .and_then(|v| v.as_n().ok())
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(0);
-
-        let checkpoint = item
-            .get("checkpoint")
-            .and_then(|v| v.as_s().ok())
-            .cloned();
-
+    fn parse_lease(item: &Item) -> Lease {
         Lease {
-            lease_key,
-            owner,
-            counter,
-            checkpoint,
-            expires_at,
+            lease_key: get_s(item, "lease_key").unwrap_or_default(),
+            owner: get_s(item, "owner"),
+            counter: get_n(item, "counter"),
+            checkpoint: get_s(item, "checkpoint"),
+            expires_at: get_n(item, "expires_at"),
             metadata: HashMap::new(),
         }
-    }
-
-    /// Helper to detect DynamoDB conditional check failures.
-    fn is_condition_failed(err: &aws_sdk_dynamodb::error::SdkError<impl std::fmt::Debug>) -> bool {
-        // The SDK wraps this as a service error; check the stringified form
-        err.to_string().contains("ConditionalCheckFailed")
     }
 }
 
 #[async_trait]
 impl LeaseStorage for DynamoLeaseStore {
     async fn list_leases(&self) -> Result<Vec<Lease>> {
+        let mut stream = self
+            .client
+            .scan()
+            .table_name(&self.table_name)
+            .into_paginator()
+            .items()
+            .send();
+
         let mut leases = Vec::new();
-        let mut last_evaluated_key = None;
-
-        loop {
-            let mut req = self.client.scan().table_name(&self.table_name);
-            if let Some(key) = last_evaluated_key {
-                req = req.set_exclusive_start_key(Some(key));
-            }
-
-            let res = req
-                .send()
-                .await
-                .map_err(|e| LeaseError::Storage(e.to_string()))?;
-
-            if let Some(items) = res.items {
-                for item in items {
-                    leases.push(Self::parse_lease(&item));
-                }
-            }
-
-            last_evaluated_key = res.last_evaluated_key;
-            if last_evaluated_key.is_none() {
-                break;
-            }
+        while let Some(item) = stream.next().await {
+            leases.push(Self::parse_lease(&item.map_err(storage_err)?));
         }
-
         Ok(leases)
     }
 
     async fn create_lease(&self, key: &str) -> Result<Lease> {
-        let lease = Lease {
+        self.client
+            .put_item()
+            .table_name(&self.table_name)
+            .item("lease_key", s(key))
+            .item("counter", n(0))
+            .item("expires_at", n(0))
+            .condition_expression("attribute_not_exists(lease_key)")
+            .send()
+            .await
+            .map_err(|e| {
+                if is_condition_failed(&e) {
+                    LeaseError::Conflict
+                } else {
+                    storage_err(e)
+                }
+            })?;
+
+        Ok(Lease {
             lease_key: key.to_string(),
             owner: None,
             counter: 0,
             checkpoint: None,
             expires_at: 0,
             metadata: HashMap::new(),
-        };
-
-        self.client
-            .put_item()
-            .table_name(&self.table_name)
-            .item("lease_key", AttributeValue::S(key.to_string()))
-            .item("counter", AttributeValue::N("0".to_string()))
-            .item("expires_at", AttributeValue::N("0".to_string()))
-            .condition_expression("attribute_not_exists(lease_key)")
-            .send()
-            .await
-            .map_err(|e| {
-                if Self::is_condition_failed(&e) {
-                    LeaseError::Conflict
-                } else {
-                    LeaseError::Storage(e.to_string())
-                }
-            })?;
-
-        Ok(lease)
+        })
     }
 
     /// Atomic acquire: conditional on counter matching the value we read.
     /// If another worker changed the counter since our read, this fails safely.
     async fn acquire_lease(&self, lease: &Lease, new_owner: &str) -> Result<bool> {
-        let new_counter = lease.counter + 1;
-        let new_expires = epoch_ms() + self.lease_duration_ms;
-
         let result = self
             .client
             .update_item()
             .table_name(&self.table_name)
-            .key("lease_key", AttributeValue::S(lease.lease_key.clone()))
-            .update_expression(
-                "SET #owner = :owner, #counter = :new_counter, #expires = :expires",
-            )
+            .key("lease_key", s(&lease.lease_key))
+            .update_expression("SET #owner = :owner, #counter = :new_counter, #expires = :expires")
             .condition_expression("#counter = :old_counter")
             .expression_attribute_names("#owner", "owner")
             .expression_attribute_names("#counter", "counter")
             .expression_attribute_names("#expires", "expires_at")
-            .expression_attribute_values(
-                ":old_counter",
-                AttributeValue::N(lease.counter.to_string()),
-            )
-            .expression_attribute_values(
-                ":new_counter",
-                AttributeValue::N(new_counter.to_string()),
-            )
-            .expression_attribute_values(":owner", AttributeValue::S(new_owner.to_string()))
-            .expression_attribute_values(":expires", AttributeValue::N(new_expires.to_string()))
+            .expression_attribute_values(":old_counter", n(lease.counter))
+            .expression_attribute_values(":new_counter", n(lease.counter + 1))
+            .expression_attribute_values(":owner", s(new_owner))
+            .expression_attribute_values(":expires", n(epoch_ms() + self.lease_duration_ms))
             .send()
             .await;
 
-        match result {
-            Ok(_) => Ok(true),
-            Err(ref e) if Self::is_condition_failed(e) => Ok(false),
-            Err(e) => Err(LeaseError::Storage(e.to_string())),
-        }
+        cond_result(result)
     }
 
     /// Renew: extends expiry, but only if we still own it (counter + owner match).
     async fn renew_lease(&self, lease: &Lease) -> Result<bool> {
-        let new_counter = lease.counter + 1;
-        let new_expires = epoch_ms() + self.lease_duration_ms;
-        let current_owner = lease.owner.as_deref().unwrap_or("");
-
         let result = self
             .client
             .update_item()
             .table_name(&self.table_name)
-            .key("lease_key", AttributeValue::S(lease.lease_key.clone()))
+            .key("lease_key", s(&lease.lease_key))
             .update_expression("SET #counter = :new_counter, #expires = :expires")
             .condition_expression("#counter = :old_counter AND #owner = :current_owner")
             .expression_attribute_names("#owner", "owner")
             .expression_attribute_names("#counter", "counter")
             .expression_attribute_names("#expires", "expires_at")
-            .expression_attribute_values(
-                ":old_counter",
-                AttributeValue::N(lease.counter.to_string()),
-            )
-            .expression_attribute_values(
-                ":new_counter",
-                AttributeValue::N(new_counter.to_string()),
-            )
-            .expression_attribute_values(":expires", AttributeValue::N(new_expires.to_string()))
-            .expression_attribute_values(
-                ":current_owner",
-                AttributeValue::S(current_owner.to_string()),
-            )
+            .expression_attribute_values(":old_counter", n(lease.counter))
+            .expression_attribute_values(":new_counter", n(lease.counter + 1))
+            .expression_attribute_values(":expires", n(epoch_ms() + self.lease_duration_ms))
+            .expression_attribute_values(":current_owner", s(lease.owner.as_deref().unwrap_or("")))
             .send()
             .await;
 
-        match result {
-            Ok(_) => Ok(true),
-            Err(ref e) if Self::is_condition_failed(e) => Ok(false),
-            Err(e) => Err(LeaseError::Storage(e.to_string())),
-        }
+        cond_result(result)
     }
 
-    /// Release: removes owner, resets expiry. Uses REMOVE for the owner attribute
-    /// and SET for counter + expiry in separate update action clauses.
+    /// Release: removes owner, resets expiry — only if we still own it.
     async fn release_lease(&self, lease: &Lease) -> Result<bool> {
-        let current_owner = lease.owner.as_deref().unwrap_or("");
-
         let result = self
             .client
             .update_item()
             .table_name(&self.table_name)
-            .key("lease_key", AttributeValue::S(lease.lease_key.clone()))
-            .update_expression(
-                "SET #counter = :new_counter, #expires = :zero REMOVE #owner",
-            )
+            .key("lease_key", s(&lease.lease_key))
+            .update_expression("SET #counter = :new_counter, #expires = :zero REMOVE #owner")
             .condition_expression("#counter = :old_counter AND #owner = :current_owner")
             .expression_attribute_names("#owner", "owner")
             .expression_attribute_names("#counter", "counter")
             .expression_attribute_names("#expires", "expires_at")
-            .expression_attribute_values(
-                ":old_counter",
-                AttributeValue::N(lease.counter.to_string()),
-            )
-            .expression_attribute_values(
-                ":new_counter",
-                AttributeValue::N((lease.counter + 1).to_string()),
-            )
-            .expression_attribute_values(":zero", AttributeValue::N("0".to_string()))
-            .expression_attribute_values(
-                ":current_owner",
-                AttributeValue::S(current_owner.to_string()),
-            )
+            .expression_attribute_values(":old_counter", n(lease.counter))
+            .expression_attribute_values(":new_counter", n(lease.counter + 1))
+            .expression_attribute_values(":zero", n(0))
+            .expression_attribute_values(":current_owner", s(lease.owner.as_deref().unwrap_or("")))
             .send()
             .await;
 
-        match result {
-            Ok(_) => Ok(true),
-            Err(ref e) if Self::is_condition_failed(e) => Ok(false),
-            Err(e) => Err(LeaseError::Storage(e.to_string())),
-        }
+        cond_result(result)
     }
 
-    /// Checkpoint: only succeeds if we still own this lease (owner guard).
-    /// Without this, a worker that lost its lease could overwrite the new
-    /// owner's checkpoint — causing data to be reprocessed.
+    /// Unconditional SET — the caller (LeaseManager) only checkpoints leases
+    /// it owns. Pass worker_id through and condition on #owner to harden.
     async fn update_checkpoint(&self, lease_key: &str, checkpoint: &str) -> Result<bool> {
-        // NOTE: In production, you should pass the worker_id through so we can
-        // condition on #owner = :me. For now we do an unconditional SET but
-        // the caller (LeaseManager) only calls this for leases it owns.
         self.client
             .update_item()
             .table_name(&self.table_name)
-            .key("lease_key", AttributeValue::S(lease_key.to_string()))
+            .key("lease_key", s(lease_key))
             .update_expression("SET #checkpoint = :checkpoint")
             .expression_attribute_names("#checkpoint", "checkpoint")
-            .expression_attribute_values(
-                ":checkpoint",
-                AttributeValue::S(checkpoint.to_string()),
-            )
+            .expression_attribute_values(":checkpoint", s(checkpoint))
             .send()
             .await
-            .map_err(|e| LeaseError::Storage(e.to_string()))?;
+            .map_err(storage_err)?;
 
         Ok(true)
     }
@@ -276,19 +213,13 @@ impl LeaseStorage for DynamoLeaseStore {
             .client
             .get_item()
             .table_name(&self.table_name)
-            .key("lease_key", AttributeValue::S(lease_key.to_string()))
+            .key("lease_key", s(lease_key))
             .projection_expression("#checkpoint")
             .expression_attribute_names("#checkpoint", "checkpoint")
             .send()
             .await
-            .map_err(|e| LeaseError::Storage(e.to_string()))?;
+            .map_err(storage_err)?;
 
-        if let Some(item) = result.item {
-            if let Some(AttributeValue::S(checkpoint)) = item.get("checkpoint") {
-                return Ok(Some(checkpoint.clone()));
-            }
-        }
-
-        Ok(None)
+        Ok(result.item.as_ref().and_then(|i| get_s(i, "checkpoint")))
     }
 }
